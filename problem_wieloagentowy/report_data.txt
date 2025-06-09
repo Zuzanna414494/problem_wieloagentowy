@@ -1,0 +1,35 @@
+RAPORT Z EKSPERYMENTU TEXAS HOLD'EM
+==================================================
+
+PODSUMOWANIE EKSPERYMENTU:
+------------------------------
+Liczba algorytmów: 3
+Najlepszy algorytm: PPO_Conservative (0.150)
+Najgorszy algorytm: A2C_Standard (0.080)
+Rozstęp wyników: 0.070
+Najszybszy trening: A2C_Standard (200.0s)
+Najstabilniejszy: A2C_Standard (σ=0.040)
+Średni wynik: 0.117
+Średni czas treningu: 250.0s
+Całkowity czas: 750.0s
+
+SZCZEGÓŁOWE WYNIKI:
+------------------------------
+
+PPO_Conservative:
+  Średnia nagroda: 0.150 ± 0.050
+  Czas treningu: 300.0s
+  Efektywność: 0.0300 nagroda/min
+  Timesteps: 100000
+
+PPO_Aggressive:
+  Średnia nagroda: 0.120 ± 0.080
+  Czas treningu: 250.0s
+  Efektywność: 0.0288 nagroda/min
+  Timesteps: 100000
+
+A2C_Standard:
+  Średnia nagroda: 0.080 ± 0.040
+  Czas treningu: 200.0s
+  Efektywność: 0.0240 nagroda/min
+  Timesteps: 100000
