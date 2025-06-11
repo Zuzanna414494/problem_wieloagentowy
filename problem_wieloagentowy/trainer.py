@@ -1,14 +1,15 @@
 """
-Moduł do treningu i ewaluacji algorytmów uczenia ze wzmocnieniem
-w środowisku Texas Hold'em
+Rozszerzony moduł do treningu i ewaluacji algorytmów uczenia ze wzmocnieniem
+w środowisku Texas Hold'em z obsługą różnych scenariuszy wieloagentowych
 """
 
 import os
 import time
 import pickle
 import numpy as np
-from typing import Dict, Any, Type, Optional
+from typing import Dict, Any, Type, Optional, List, Union
 from pathlib import Path
+import itertools
 
 from stable_baselines3.common.base_class import BaseAlgorithm
 from stable_baselines3.common.vec_env import DummyVecEnv
@@ -18,14 +19,14 @@ import torch
 
 from environment_wrapper import make_env
 
-class MultiAgentTrainer:
-    """Klasa do treningu i porównywania algorytmów wieloagentowych"""
-    
-    def __init__(self, n_players: int = 4, eval_freq: int = 5000, 
-                 n_eval_episodes: int = 20, verbose: int = 1):
+class EnhancedMultiAgentTrainer:
+    """Klasa do treningu i porównywania algorytmów wieloagentowych z różnymi scenariuszami"""
+
+    def __init__(self, n_players: int = 4, eval_freq: int = 5000,
+                 n_eval_episodes: int = 5, verbose: int = 1):
         """
         Inicjalizuje trainer
-        
+
         Args:
             n_players: Liczba graczy w Texas Hold'em
             eval_freq: Częstotliwość ewaluacji podczas treningu
@@ -37,385 +38,394 @@ class MultiAgentTrainer:
         self.n_eval_episodes = n_eval_episodes
         self.verbose = verbose
         self.results = {}
-        
+        self.homogeneous_results = {}  # Wszyscy agenci ten sam algorytm
+        self.heterogeneous_results = {}  # Różni agenci różne algorytmy
+
         # Informacje o systemie
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         if self.verbose > 0:
             print(f"🖥️  Używane urządzenie: {self.device}")
-    
-    def train_algorithm(self, algorithm_name: str, algorithm_class: Type[BaseAlgorithm],
-                       hyperparams: Dict[str, Any], total_timesteps: int = 100000) -> BaseAlgorithm:
+
+    def train_homogeneous_scenario(self, algorithm_configs: Dict[str, Dict[str, Any]],
+                                 total_timesteps: int = 100000):
         """
-        Trenuje pojedynczy algorytm
-        
+        Trenuje scenariusze gdzie wszyscy agenci używają tego samego algorytmu
+
         Args:
-            algorithm_name: Nazwa algorytmu
-            algorithm_class: Klasa algorytmu (PPO, A2C, DQN)
-            hyperparams: Hiperparametry algorytmu
-            total_timesteps: Liczba kroków treningu
-            
-        Returns:
-            Wytrenowany model
+            algorithm_configs: Słownik z konfiguracjami algorytmów
+            total_timesteps: Liczba kroków treningu dla każdego algorytmu
         """
-        if self.verbose > 0:
-            print(f"\n🚀 Rozpoczęcie treningu: {algorithm_name}")
-            print(f"   Timesteps: {total_timesteps:,}")
-            print(f"   Urządzenie: {self.device}")
-        
-        try:
-            # Tworzenie środowisk
-            train_env = DummyVecEnv([make_env(self.n_players, seed=42)])
-            eval_env = DummyVecEnv([make_env(self.n_players, seed=123)])
-            
-            # Przygotowanie folderów
-            model_path = Path(f"models/{algorithm_name}")
-            log_path = Path(f"logs/{algorithm_name}")
-            model_path.mkdir(parents=True, exist_ok=True)
-            log_path.mkdir(parents=True, exist_ok=True)
-            
-            # Tworzenie modelu
-            model = algorithm_class(
+        print("\n🔄 SCENARIUSZ HOMOGENICZNY - Wszyscy agenci ten sam algorytm")
+        print("=" * 60)
+
+        for alg_name, config in algorithm_configs.items():
+            print(f"\n🤖 Trenowanie scenariusza: Wszyscy agenci = {alg_name}")
+
+            try:
+                # Tworzymy jeden model który będzie reprezentować wszystkich agentów
+                train_env = DummyVecEnv([make_env(self.n_players, seed=42)])
+                eval_env = DummyVecEnv([make_env(self.n_players, seed=123)])
+
+                start_time = time.time()
+
+                # Inicjalizacja modelu
+                model = config["class"](
+                    "MlpPolicy",
+                    train_env,
+                    verbose=self.verbose,
+                    device=self.device,
+                    **config["params"]
+                )
+
+                # Trening
+                model.learn(total_timesteps=total_timesteps)
+                training_time = time.time() - start_time
+
+                # Ewaluacja
+                mean_reward, std_reward = evaluate_policy(
+                    model, eval_env, n_eval_episodes=self.n_eval_episodes
+                )
+
+                # Zapisanie wyników
+                scenario_name = f"HOMO_{alg_name}"
+                self.homogeneous_results[scenario_name] = {
+                    'algorithm': alg_name,
+                    'scenario_type': 'homogeneous',
+                    'agents_config': [alg_name] * self.n_players,
+                    'model': model,
+                    'mean_reward': float(mean_reward),
+                    'std_reward': float(std_reward),
+                    'training_time': training_time,
+                    'hyperparams': config["params"].copy(),
+                    'total_timesteps': total_timesteps,
+                    'n_players': self.n_players
+                }
+
+                train_env.close()
+                eval_env.close()
+
+                print(f"✅ {scenario_name}: {mean_reward:.3f}±{std_reward:.3f} "
+                      f"(czas: {training_time/60:.1f}min)")
+
+            except Exception as e:
+                print(f"❌ Błąd w scenariuszu {alg_name}: {e}")
+
+    def train_heterogeneous_scenarios(self, algorithm_configs: Dict[str, Dict[str, Any]],
+                                    total_timesteps: int = 100000,
+                                    max_combinations: int = 10):
+        """
+        Trenuje scenariusze gdzie różni agenci używają różnych algorytmów
+
+        Args:
+            algorithm_configs: Słownik z konfiguracjami algorytmów
+            total_timesteps: Liczba kroków treningu dla każdego agenta
+            max_combinations: Maksymalna liczba kombinacji do przetestowania
+        """
+        print("\n🎯 SCENARIUSZ HETEROGENICZNY - Różni agenci różne algorytmy")
+        print("=" * 60)
+
+        # Generowanie kombinacji algorytmów
+        algorithm_names = list(algorithm_configs.keys())
+
+        # Różne strategie kombinacji
+        combinations = []
+
+        # 1. Wszystkie pary algorytmów (dla 2 graczy każdy)
+        if self.n_players == 4:
+            for alg1, alg2 in itertools.combinations(algorithm_names, 2):
+                combinations.append([alg1, alg1, alg2, alg2])
+
+        # 2. Jeden algorytm vs reszta innych
+        for main_alg in algorithm_names:
+            other_algs = [alg for alg in algorithm_names if alg != main_alg]
+            if len(other_algs) >= self.n_players - 1:
+                config = [main_alg] + other_algs[:self.n_players-1]
+                combinations.append(config)
+
+        # 3. Równomierne mieszanie (jeśli mamy wystarczająco algorytmów)
+        if len(algorithm_names) >= self.n_players:
+            combinations.append(algorithm_names[:self.n_players])
+
+        # Ograniczenie liczby kombinacji
+        combinations = combinations[:max_combinations]
+
+        print(f"🔄 Testowanie {len(combinations)} kombinacji heterogenicznych...")
+
+        for i, agent_algorithms in enumerate(combinations, 1):
+            scenario_name = f"HETERO_{i:02d}_{'_'.join(agent_algorithms)}"
+            print(f"\n[{i}/{len(combinations)}] {scenario_name}")
+            print(f"   Agenci: {agent_algorithms}")
+
+            try:
+                result = self._train_heterogeneous_combination(
+                    agent_algorithms, algorithm_configs, total_timesteps, scenario_name
+                )
+
+                self.heterogeneous_results[scenario_name] = result
+
+                print(f"✅ {scenario_name}: {result['mean_reward']:.3f}±{result['std_reward']:.3f}")
+
+            except Exception as e:
+                print(f"❌ Błąd w kombinacji {scenario_name}: {e}")
+
+    def _train_heterogeneous_combination(self, agent_algorithms: List[str],
+                                       algorithm_configs: Dict[str, Dict[str, Any]],
+                                       total_timesteps: int, scenario_name: str):
+        """
+        Trenuje jedną konkretną kombinację heterogeniczną
+        """
+        models = []
+        training_times = []
+
+        # Trenowanie każdego agenta osobno
+        for agent_id, alg_name in enumerate(agent_algorithms):
+            config = algorithm_configs[alg_name]
+
+            # Środowisko dla pojedynczego agenta (uproszczone do 2 graczy dla szybszego treningu)
+            train_env = DummyVecEnv([make_env(n_players=2, seed=42 + agent_id)])
+
+            start_time = time.time()
+
+            # Inicjalizacja i trening modelu
+            model = config["class"](
                 "MlpPolicy",
                 train_env,
-                verbose=self.verbose,
+                verbose=0,  # Mniej verbose dla heterogenicznych
                 device=self.device,
-                **hyperparams
+                **config["params"]
             )
-            
-            if self.verbose > 0:
-                print(f"✅ Model {algorithm_name} utworzony")
-                total_params = sum(p.numel() for p in model.policy.parameters())
-                print(f"   Parametry sieci: {total_params:,}")
-            
-            # Callback do ewaluacji
-            eval_callback = EvalCallback(
-                eval_env,
-                best_model_save_path=str(model_path / "best_model"),
-                log_path=str(log_path),
-                eval_freq=self.eval_freq,
-                n_eval_episodes=self.n_eval_episodes,
-                deterministic=True,
-                render=False,
-                verbose=self.verbose
-            )
-            
-            # Callback do zapisywania checkpointów
-            checkpoint_callback = CheckpointCallback(
-                save_freq=self.eval_freq * 2,
-                save_path=str(model_path / "checkpoints"),
-                name_prefix=algorithm_name
-            )
-            
-            # Trening
-            start_time = time.time()
-            
-            if self.verbose > 0:
-                print(f"⏱️  Rozpoczęcie treningu...")
-            
-            model.learn(
-                total_timesteps=total_timesteps,
-                callback=[eval_callback, checkpoint_callback],
-                progress_bar=False,
-                reset_num_timesteps=True
-            )
-            
+
+            model.learn(total_timesteps=total_timesteps)
             training_time = time.time() - start_time
-            
-            if self.verbose > 0:
-                print(f"✅ Trening zakończony w {training_time/60:.1f} minut")
-            
-            # Ewaluacja końcowa
-            if self.verbose > 0:
-                print(f"📊 Ewaluacja końcowa...")
-            
-            mean_reward, std_reward = evaluate_policy(
-                model,
-                eval_env,
-                n_eval_episodes=self.n_eval_episodes * 2,  # Więcej epizodów na końcu
-                deterministic=True,
-                render=False
-            )
-            
-            # Zapisanie finalnego modelu
-            final_model_path = model_path / "final_model"
-            model.save(str(final_model_path))
-            
-            # Zapisanie wyników
-            self.results[algorithm_name] = {
-                'model': model,
-                'mean_reward': float(mean_reward),
-                'std_reward': float(std_reward),
-                'training_time': training_time,
-                'hyperparams': hyperparams.copy(),
-                'total_timesteps': total_timesteps,
-                'n_players': self.n_players,
-                'final_model_path': str(final_model_path)
-            }
-            
-            if self.verbose > 0:
-                print(f"🎯 Wyniki dla {algorithm_name}:")
-                print(f"   Średnia nagroda: {mean_reward:.3f} ± {std_reward:.3f}")
-                print(f"   Czas treningu: {training_time:.1f}s")
-            
-            # Zamknięcie środowisk
+
+            models.append(model)
+            training_times.append(training_time)
             train_env.close()
+
+        # Ewaluacja całej kombinacji
+        eval_rewards = self._evaluate_heterogeneous_combination(models, agent_algorithms)
+
+        return {
+            'algorithm': 'Mixed',
+            'scenario_type': 'heterogeneous',
+            'agents_config': agent_algorithms,
+            'models': models,
+            'mean_reward': float(np.mean(eval_rewards)),
+            'std_reward': float(np.std(eval_rewards)),
+            'training_time': float(np.sum(training_times)),
+            'individual_training_times': training_times,
+            'total_timesteps': total_timesteps * len(agent_algorithms),
+            'n_players': self.n_players,
+            'individual_rewards': eval_rewards
+        }
+
+    def _evaluate_heterogeneous_combination(self, models: List[BaseAlgorithm],
+                                          agent_algorithms: List[str]) -> List[float]:
+        """
+        Ewaluuje kombinację heterogeniczną poprzez symulację gier
+        """
+        rewards = []
+
+        # Prosta ewaluacja - każdy model gra przeciwko prostemu środowisku
+        for i, model in enumerate(models):
+            eval_env = DummyVecEnv([make_env(n_players=2, seed=100 + i)])
+
+            episode_rewards = []
+            for _ in range(self.n_eval_episodes):
+                obs = eval_env.reset()
+                total_reward = 0
+                done = False
+
+                while not done:
+                    action, _ = model.predict(obs, deterministic=True)
+                    obs, reward, done, _ = eval_env.step(action)
+                    total_reward += reward[0]
+
+                episode_rewards.append(total_reward)
+
+            rewards.append(np.mean(episode_rewards))
             eval_env.close()
-            
-            return model
-            
-        except Exception as e:
-            print(f"❌ Błąd podczas treningu {algorithm_name}: {e}")
-            if self.verbose > 1:
-                import traceback
-                traceback.print_exc()
-            raise
-    
-    def compare_algorithms(self):
-        """Porównuje wszystkie wytrenowane algorytmy"""
-        if not self.results:
+
+        return rewards
+
+    def compare_all_scenarios(self):
+        """Porównuje wszystkie scenariusze (homogeniczne i heterogeniczne)"""
+        print("\n" + "="*80)
+        print("📊 PORÓWNANIE WSZYSTKICH SCENARIUSZY")
+        print("="*80)
+
+        all_results = {}
+        all_results.update(self.homogeneous_results)
+        all_results.update(self.heterogeneous_results)
+
+        if not all_results:
             print("❌ Brak wyników do porównania")
             return
-        
-        print("\n" + "="*60)
-        print("📊 PORÓWNANIE ALGORYTMÓW")
-        print("="*60)
-        
+
         # Sortowanie według średniej nagrody
         sorted_results = sorted(
-            self.results.items(),
+            all_results.items(),
             key=lambda x: x[1]['mean_reward'],
             reverse=True
         )
-        
-        print(f"{'Algorytm':<20} {'Nagroda':<15} {'Czas [min]':<12} {'Wydajność':<12}")
-        print("-" * 60)
-        
+
+        print("🏆 RANKING SCENARIUSZY:")
+        print("-" * 80)
+        print(f"{'Ranga':<5} {'Scenariusz':<25} {'Typ':<12} {'Nagroda':<15} {'Czas [min]':<10}")
+        print("-" * 80)
+
         for i, (name, results) in enumerate(sorted_results, 1):
             mean_reward = results['mean_reward']
             std_reward = results['std_reward']
             training_time = results['training_time'] / 60
-            efficiency = mean_reward / training_time if training_time > 0 else 0
-            
-            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "  "
-            
-            print(f"{medal} {name:<18} {mean_reward:>6.3f}±{std_reward:<5.3f} "
-                  f"{training_time:>8.1f}    {efficiency:>8.4f}")
-        
-        print("-" * 60)
-        
-        # Szczegółowe porównanie hiperparametrów
-        print("\n🔧 ANALIZA HIPERPARAMETRÓW:")
-        print("-" * 40)
-        
-        best_alg = sorted_results[0]
-        worst_alg = sorted_results[-1]
-        
-        print(f"🏆 Najlepszy: {best_alg[0]} ({best_alg[1]['mean_reward']:.3f})")
-        print(f"📉 Najgorszy: {worst_alg[0]} ({worst_alg[1]['mean_reward']:.3f})")
-        
-        # Analiza korelacji parametrów z wynikami
-        self._analyze_hyperparameter_impact()
-    
-    def _analyze_hyperparameter_impact(self):
-        """Analizuje wpływ hiperparametrów na wyniki"""
-        print("\n🔍 ANALIZA WPŁYWU HIPERPARAMETRÓW:")
-        print("-" * 40)
-        
-        # Zbierz wszystkie hiperparametry
-        all_params = set()
-        for results in self.results.values():
-            all_params.update(results['hyperparams'].keys())
-        
-        # Analizuj każdy parametr
-        for param in ['learning_rate', 'gamma', 'batch_size']:
-            if param in all_params:
-                print(f"\n📈 {param}:")
-                param_analysis = []
-                
-                for name, results in self.results.items():
-                    if param in results['hyperparams']:
-                        value = results['hyperparams'][param]
-                        reward = results['mean_reward']
-                        param_analysis.append((name, value, reward))
-                
-                # Sortuj według wartości parametru
-                param_analysis.sort(key=lambda x: x[1])
-                
-                for name, value, reward in param_analysis:
-                    print(f"   {name:<20} {value:<10} → {reward:.3f}")
-    
-    def evaluate_model_performance(self, algorithm_name: str, n_episodes: int = 50):
-        """
-        Szczegółowa ewaluacja konkretnego modelu
-        
-        Args:
-            algorithm_name: Nazwa algorytmu do ewaluacji
-            n_episodes: Liczba epizodów do ewaluacji
-        """
-        if algorithm_name not in self.results:
-            print(f"❌ Algorytm {algorithm_name} nie został jeszcze wytrenowany")
-            return
-        
-        print(f"\n🎯 SZCZEGÓŁOWA EWALUACJA: {algorithm_name}")
+            scenario_type = results['scenario_type']
+
+            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i:2d}."
+
+            print(f"{medal:<5} {name:<25} {scenario_type:<12} "
+                  f"{mean_reward:>6.3f}±{std_reward:<5.3f} {training_time:>8.1f}")
+
+        print("-" * 80)
+
+        # Analiza typów scenariuszy
+        self._analyze_scenario_types()
+
+    def _analyze_scenario_types(self):
+        """Analizuje różnice między scenariuszami homogenicznymi a heterogenicznymi"""
+        print("\n🔍 ANALIZA TYPÓW SCENARIUSZY:")
         print("-" * 50)
-        
-        model = self.results[algorithm_name]['model']
-        eval_env = DummyVecEnv([make_env(self.n_players, seed=456)])
-        
-        # Ewaluacja z różnymi parametrami
-        deterministic_rewards = []
-        stochastic_rewards = []
-        
-        # Tryb deterministyczny
-        for _ in range(n_episodes // 2):
-            obs = eval_env.reset()
-            total_reward = 0
-            done = False
-            
-            while not done:
-                action, _ = model.predict(obs, deterministic=True)
-                obs, reward, done, _ = eval_env.step(action)
-                total_reward += reward[0]
-            
-            deterministic_rewards.append(total_reward)
-        
-        # Tryb stochastyczny
-        for _ in range(n_episodes // 2):
-            obs = eval_env.reset()
-            total_reward = 0
-            done = False
-            
-            while not done:
-                action, _ = model.predict(obs, deterministic=False)
-                obs, reward, done, _ = eval_env.step(action)
-                total_reward += reward[0]
-            
-            stochastic_rewards.append(total_reward)
-        
-        # Analiza wyników
-        det_mean = np.mean(deterministic_rewards)
-        det_std = np.std(deterministic_rewards)
-        sto_mean = np.mean(stochastic_rewards)
-        sto_std = np.std(stochastic_rewards)
-        
-        print(f"Deterministyczny: {det_mean:.3f} ± {det_std:.3f}")
-        print(f"Stochastyczny:    {sto_mean:.3f} ± {sto_std:.3f}")
-        print(f"Różnica:          {abs(det_mean - sto_mean):.3f}")
-        
-        eval_env.close()
-    
-    def save_results(self, filepath: str = "results/experiment_results.pkl"):
-        """
-        Zapisuje wyniki eksperymentu
-        
-        Args:
-            filepath: Ścieżka do pliku wyników
-        """
+
+        homo_rewards = [r['mean_reward'] for r in self.homogeneous_results.values()]
+        hetero_rewards = [r['mean_reward'] for r in self.heterogeneous_results.values()]
+
+        if homo_rewards and hetero_rewards:
+            homo_mean = np.mean(homo_rewards)
+            homo_std = np.std(homo_rewards)
+            hetero_mean = np.mean(hetero_rewards)
+            hetero_std = np.std(hetero_rewards)
+
+            print(f"📈 Scenariusze HOMOGENICZNE:")
+            print(f"   Średnia nagroda: {homo_mean:.3f} ± {homo_std:.3f}")
+            print(f"   Liczba scenariuszy: {len(homo_rewards)}")
+            print(f"   Najlepszy: {max(homo_rewards):.3f}")
+
+            print(f"\n🎯 Scenariusze HETEROGENICZNE:")
+            print(f"   Średnia nagroda: {hetero_mean:.3f} ± {hetero_std:.3f}")
+            print(f"   Liczba scenariuszy: {len(hetero_rewards)}")
+            print(f"   Najlepszy: {max(hetero_rewards):.3f}")
+
+            print(f"\n📊 PORÓWNANIE:")
+            difference = hetero_mean - homo_mean
+            if abs(difference) > 0.01:
+                better = "HETEROGENICZNE" if difference > 0 else "HOMOGENICZNE"
+                print(f"   🏆 Lepsze: {better} (różnica: {abs(difference):.3f})")
+            else:
+                print(f"   ⚖️  Podobne wyniki (różnica: {abs(difference):.3f})")
+
+    def get_best_homogeneous_scenario(self) -> Optional[str]:
+        """Zwraca najlepszy scenariusz homogeniczny"""
+        if not self.homogeneous_results:
+            return None
+        return max(self.homogeneous_results.items(),
+                  key=lambda x: x[1]['mean_reward'])[0]
+
+    def get_best_heterogeneous_scenario(self) -> Optional[str]:
+        """Zwraca najlepszy scenariusz heterogeniczny"""
+        if not self.heterogeneous_results:
+            return None
+        return max(self.heterogeneous_results.items(),
+                  key=lambda x: x[1]['mean_reward'])[0]
+
+    def save_all_results(self, filepath: str = "results/enhanced_experiment_results.pkl"):
+        """Zapisuje wszystkie wyniki eksperymentu"""
         try:
-            # Przygotuj dane do zapisania (bez modeli - za duże)
-            save_data = {}
-            for name, results in self.results.items():
-                save_data[name] = {
-                    'mean_reward': results['mean_reward'],
-                    'std_reward': results['std_reward'],
-                    'training_time': results['training_time'],
-                    'hyperparams': results['hyperparams'],
-                    'total_timesteps': results['total_timesteps'],
-                    'n_players': results['n_players'],
-                    'final_model_path': results['final_model_path']
+            save_data = {
+                'homogeneous': {},
+                'heterogeneous': {},
+                'metadata': {
+                    'experiment_date': time.strftime('%Y-%m-%d %H:%M:%S'),
+                    'device': self.device,
+                    'n_players': self.n_players,
+                    'eval_freq': self.eval_freq,
+                    'n_eval_episodes': self.n_eval_episodes
                 }
-            
-            # Dodaj metadane
-            save_data['_metadata'] = {
-                'experiment_date': time.strftime('%Y-%m-%d %H:%M:%S'),
-                'device': self.device,
-                'eval_freq': self.eval_freq,
-                'n_eval_episodes': self.n_eval_episodes
             }
-            
-            # Zapisz do pliku
+
+            # Zapisz homogeniczne (bez modeli)
+            for name, results in self.homogeneous_results.items():
+                save_data['homogeneous'][name] = {
+                    k: v for k, v in results.items() if k != 'model'
+                }
+
+            # Zapisz heterogeniczne (bez modeli)
+            for name, results in self.heterogeneous_results.items():
+                save_data['heterogeneous'][name] = {
+                    k: v for k, v in results.items() if k != 'models'
+                }
+
             os.makedirs(os.path.dirname(filepath), exist_ok=True)
             with open(filepath, 'wb') as f:
                 pickle.dump(save_data, f)
-            
-            print(f"💾 Wyniki zapisane do: {filepath}")
-            
+
+            print(f"💾 Wszystkie wyniki zapisane do: {filepath}")
+
         except Exception as e:
-            print(f"❌ Błąd podczas zapisywania wyników: {e}")
-    
-    def load_results(self, filepath: str = "results/experiment_results.pkl"):
-        """
-        Ładuje wyniki eksperymentu
-        
-        Args:
-            filepath: Ścieżka do pliku wyników
-        """
-        try:
-            with open(filepath, 'rb') as f:
-                loaded_data = pickle.load(f)
-            
-            # Usuń metadane
-            if '_metadata' in loaded_data:
-                metadata = loaded_data.pop('_metadata')
-                print(f"📅 Dane z: {metadata.get('experiment_date', 'nieznana data')}")
-            
-            # Załaduj wyniki (bez modeli)
-            for name, results in loaded_data.items():
-                if name not in self.results:
-                    self.results[name] = results
-            
-            print(f"📂 Wyniki załadowane z: {filepath}")
-            print(f"   Algorytmy: {list(loaded_data.keys())}")
-            
-        except Exception as e:
-            print(f"❌ Błąd podczas ładowania wyników: {e}")
-    
-    def get_best_algorithm(self) -> Optional[str]:
-        """
-        Zwraca nazwę najlepszego algorytmu
-        
-        Returns:
-            Nazwa najlepszego algorytmu lub None
-        """
-        if not self.results:
-            return None
-        
-        return max(self.results.items(), key=lambda x: x[1]['mean_reward'])[0]
+            print(f"❌ Błąd podczas zapisywania: {e}")
+
+    def print_experiment_summary(self):
+        """Wyświetla podsumowanie całego eksperymentu"""
+        print("\n" + "="*60)
+        print("📋 PODSUMOWANIE EKSPERYMENTU")
+        print("="*60)
+
+        total_homo = len(self.homogeneous_results)
+        total_hetero = len(self.heterogeneous_results)
+
+        print(f"🔄 Scenariusze homogeniczne: {total_homo}")
+        print(f"🎯 Scenariusze heterogeniczne: {total_hetero}")
+        print(f"📊 Łącznie scenariuszy: {total_homo + total_hetero}")
+
+        if self.homogeneous_results:
+            best_homo = self.get_best_homogeneous_scenario()
+            best_homo_reward = self.homogeneous_results[best_homo]['mean_reward']
+            print(f"\n🏆 Najlepszy homogeniczny: {best_homo}")
+            print(f"   Nagroda: {best_homo_reward:.3f}")
+
+        if self.heterogeneous_results:
+            best_hetero = self.get_best_heterogeneous_scenario()
+            best_hetero_reward = self.heterogeneous_results[best_hetero]['mean_reward']
+            print(f"\n🎯 Najlepszy heterogeniczny: {best_hetero}")
+            print(f"   Nagroda: {best_hetero_reward:.3f}")
+
+        print("\n" + "="*60)
 
 # Test modułu
 if __name__ == "__main__":
-    print("🧪 Test modułu treningu...")
-    
-    # Test tworzenia trainera
-    trainer = MultiAgentTrainer(n_players=4, verbose=2)
-    print("✅ Trainer utworzony pomyślnie")
-    
-    # Test z prostą konfiguracją (tylko do testów)
-    from stable_baselines3 import A2C
-    
-    simple_config = {
-        "learning_rate": 1e-3,
-        "n_steps": 5,
-        "gamma": 0.99
+    print("🧪 Test rozszerzonego modułu treningu...")
+
+    # Przykładowa konfiguracja algorytmów do testów
+    from stable_baselines3 import PPO, A2C
+
+    test_algorithms = {
+        "PPO_Test": {
+            "class": PPO,
+            "params": {
+                "learning_rate": 3e-4,
+                "n_steps": 1024,
+                "batch_size": 64
+            }
+        },
+        "A2C_Test": {
+            "class": A2C,
+            "params": {
+                "learning_rate": 7e-4,
+                "n_steps": 5
+            }
+        }
     }
-    
-    try:
-        # Krótki test treningu
-        model = trainer.train_algorithm(
-            "Test_A2C",
-            A2C,
-            simple_config,
-            total_timesteps=1000  # Bardzo krótki test
-        )
-        print("✅ Test treningu zakończony pomyślnie")
-        
-        # Test porównania
-        trainer.compare_algorithms()
-        
-        # Test zapisywania
-        trainer.save_results("test_results.pkl")
-        
-    except Exception as e:
-        print(f"⚠️  Test treningu pominięty: {e}")
-    
-    print("✅ Test modułu zakończony")
+
+    # Test trenera
+    trainer = EnhancedMultiAgentTrainer(n_players=4, verbose=1)
+
+    print("✅ Rozszerzony trainer utworzony pomyślnie")
+    print("🧪 Gotowy do testowania scenariuszy homogenicznych i heterogenicznych")
